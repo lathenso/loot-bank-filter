@@ -1,5 +1,7 @@
 # Loot Bank Filter
 
+[![Support me on Ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/lathenso)
+
 Tracks the loot you receive per monster/boss during your session and lets you
 filter your bank to show **only the items you looted** — either everything, or
 one source at a time.
