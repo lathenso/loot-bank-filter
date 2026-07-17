@@ -57,7 +57,7 @@ public interface LootBankFilterConfig extends Config
 	@ConfigItem(
 		keyName = "maxSavedSessions",
 		name = "Max saved sessions",
-		description = "How many saved sessions to keep; the oldest are dropped first",
+		description = "How many saved sessions to keep; the oldest are folded into the permanent lifetime archive first",
 		position = 4
 	)
 	default int maxSavedSessions()

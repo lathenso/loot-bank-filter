@@ -92,6 +92,7 @@ public class LootBankFilterPlugin extends Plugin
 	/** Config group/key used to persist saved sessions as JSON. */
 	private static final String CONFIG_GROUP = "lootbankfilter";
 	private static final String KEY_SAVED_SESSIONS = "savedSessions";
+	private static final String KEY_LIFETIME_ARCHIVE = "lifetimeArchive";
 
 	private static final int BUTTON_WIDTH = 60;
 	private static final int BUTTON_HEIGHT = 16;
@@ -401,6 +402,16 @@ public class LootBankFilterPlugin extends Plugin
 
 		final Map<String, LootSource> merged = new LinkedHashMap<>();
 
+		// 1) The permanent lifetime archive: sessions that aged out of the
+		//    saved-session cap live on here, so nothing is ever lost.
+		final LifetimeArchive archive = readLifetimeArchive();
+		for (SavedSource s : archive.sources)
+		{
+			mergeSavedSourceInto(merged, s, archive.updatedAt);
+		}
+
+		// 2) Every stored session (except the current one's own entry — its
+		//    live data below is always at least as new as its last auto-save).
 		for (SavedSession saved : readSavedSessions())
 		{
 			if (saved.startedAt == currentSessionStart || saved.sources == null)
@@ -409,25 +420,7 @@ public class LootBankFilterPlugin extends Plugin
 			}
 			for (SavedSource s : saved.sources)
 			{
-				final LootSource m = merged.computeIfAbsent(s.name, LootSource::new);
-				m.kills += s.kills;
-				m.lastUpdated = Math.max(m.lastUpdated,
-					s.updatedAt != 0 ? s.updatedAt : saved.savedAt);
-				if (s.items == null)
-				{
-					continue;
-				}
-				for (SavedItem i : s.items)
-				{
-					TrackedItem t = m.items.get(i.id);
-					if (t == null)
-					{
-						final ItemComposition comp = itemManager.getItemComposition(i.id);
-						t = new TrackedItem(i.id, i.name, comp.getHaPrice(), comp.isTradeable());
-						m.items.put(i.id, t);
-					}
-					t.quantity += i.qty;
-				}
+				mergeSavedSourceInto(merged, s, saved.savedAt);
 			}
 		}
 
@@ -450,6 +443,125 @@ public class LootBankFilterPlugin extends Plugin
 		}
 
 		return merged;
+	}
+
+	/**
+	 * Merges one persisted source into a live view map. Resolves item
+	 * compositions, so it must run on the client thread.
+	 */
+	private void mergeSavedSourceInto(Map<String, LootSource> merged, SavedSource s, long fallbackUpdatedAt)
+	{
+		final LootSource m = merged.computeIfAbsent(s.name, LootSource::new);
+		m.kills += s.kills;
+		m.lastUpdated = Math.max(m.lastUpdated, s.updatedAt != 0 ? s.updatedAt : fallbackUpdatedAt);
+		if (s.items == null)
+		{
+			return;
+		}
+		for (SavedItem i : s.items)
+		{
+			TrackedItem t = m.items.get(i.id);
+			if (t == null)
+			{
+				final ItemComposition comp = itemManager.getItemComposition(i.id);
+				t = new TrackedItem(i.id, i.name, comp.getHaPrice(), comp.isTradeable());
+				m.items.put(i.id, t);
+			}
+			t.quantity += i.qty;
+		}
+	}
+
+	/**
+	 * Folds one session into the lifetime archive. Pure data merge (no
+	 * client calls), so it is safe from the shutdown thread too.
+	 */
+	private static void mergeSessionIntoArchive(LifetimeArchive archive, SavedSession session)
+	{
+		if (session.sources == null)
+		{
+			return;
+		}
+		for (SavedSource s : session.sources)
+		{
+			SavedSource target = null;
+			for (SavedSource a : archive.sources)
+			{
+				if (a.name.equals(s.name))
+				{
+					target = a;
+					break;
+				}
+			}
+			if (target == null)
+			{
+				target = new SavedSource();
+				target.name = s.name;
+				target.items = new ArrayList<>();
+				archive.sources.add(target);
+			}
+			target.kills += s.kills;
+			target.updatedAt = Math.max(target.updatedAt,
+				s.updatedAt != 0 ? s.updatedAt : session.savedAt);
+			if (s.items == null)
+			{
+				continue;
+			}
+			if (target.items == null)
+			{
+				target.items = new ArrayList<>();
+			}
+			for (SavedItem i : s.items)
+			{
+				SavedItem ti = null;
+				for (SavedItem a : target.items)
+				{
+					if (a.id == i.id)
+					{
+						ti = a;
+						break;
+					}
+				}
+				if (ti == null)
+				{
+					ti = new SavedItem();
+					ti.id = i.id;
+					ti.name = i.name;
+					target.items.add(ti);
+				}
+				ti.qty += i.qty;
+			}
+		}
+	}
+
+	private LifetimeArchive readLifetimeArchive()
+	{
+		final String json = configManager.getConfiguration(CONFIG_GROUP, KEY_LIFETIME_ARCHIVE);
+		LifetimeArchive archive = null;
+		if (json != null && !json.isEmpty())
+		{
+			try
+			{
+				archive = gson.fromJson(json, LifetimeArchive.class);
+			}
+			catch (JsonSyntaxException ex)
+			{
+				log.warn("Corrupt lifetime archive", ex);
+			}
+		}
+		if (archive == null)
+		{
+			archive = new LifetimeArchive();
+		}
+		if (archive.sources == null)
+		{
+			archive.sources = new ArrayList<>();
+		}
+		return archive;
+	}
+
+	private void writeLifetimeArchive(LifetimeArchive archive)
+	{
+		configManager.setConfiguration(CONFIG_GROUP, KEY_LIFETIME_ARCHIVE, gson.toJson(archive));
 	}
 
 	/**
@@ -650,9 +762,28 @@ public class LootBankFilterPlugin extends Plugin
 		sessions.removeIf(s -> s.startedAt == saved.startedAt);
 		sessions.add(0, saved);
 		sessions.sort((a, b) -> Long.compare(b.startedAt, a.startedAt));
-		while (sessions.size() > config.maxSavedSessions())
+		// Over the cap? Fold the oldest sessions into the permanent lifetime
+		// archive BEFORE dropping them, so the all-time view never loses
+		// loot. (Manually deleted sessions are NOT archived — an explicit
+		// delete is honored as a real delete.)
+		if (sessions.size() > config.maxSavedSessions())
 		{
-			sessions.remove(sessions.size() - 1); // drop the oldest
+			final LifetimeArchive archive = readLifetimeArchive();
+			int folded = 0;
+			while (sessions.size() > config.maxSavedSessions())
+			{
+				mergeSessionIntoArchive(archive, sessions.remove(sessions.size() - 1));
+				folded++;
+			}
+			archive.updatedAt = System.currentTimeMillis();
+			writeLifetimeArchive(archive);
+
+			final String notice = folded == 1
+				? "Oldest saved session folded into the lifetime archive (session cap reached)."
+				: folded + " oldest saved sessions folded into the lifetime archive (session cap reached).";
+			// invokeLater so this is safe even when saving from the shutdown
+			// thread (the message is simply skipped if the client is closing).
+			clientThread.invokeLater(() -> message(notice));
 		}
 		writeSavedSessions(sessions);
 
@@ -735,7 +866,7 @@ public class LootBankFilterPlugin extends Plugin
 			if (sessions.removeIf(s -> s.startedAt == sessionId))
 			{
 				writeSavedSessions(sessions);
-				message("Saved session deleted.");
+				message("Saved session deleted (not folded into the lifetime archive).");
 			}
 		});
 	}
@@ -797,6 +928,7 @@ public class LootBankFilterPlugin extends Plugin
 			lootSources.clear();
 			sessionLoot.clear();
 			writeSavedSessions(new ArrayList<>());
+			configManager.unsetConfiguration(CONFIG_GROUP, KEY_LIFETIME_ARCHIVE);
 
 			currentSessionStart = System.currentTimeMillis();
 			dirtySinceSave = false;
@@ -807,7 +939,7 @@ public class LootBankFilterPlugin extends Plugin
 			}
 
 			refreshPanel();
-			message("All sessions deleted, including saved history.");
+			message("All sessions deleted, including saved history and the lifetime archive.");
 		});
 	}
 
@@ -1298,6 +1430,16 @@ public class LootBankFilterPlugin extends Plugin
 	private static final class SavedSessionList
 	{
 		List<SavedSession> sessions;
+	}
+
+	/**
+	 * Permanent all-time archive. Sessions trimmed from the saved list get
+	 * merged in here first, so the lifetime view never silently loses loot.
+	 */
+	private static final class LifetimeArchive
+	{
+		long updatedAt;
+		List<SavedSource> sources;
 	}
 
 	private static final class SavedSession

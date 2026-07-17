@@ -117,7 +117,7 @@ class LootBankFilterPanel extends PluginPanel
 		{
 			// Destructive and irreversible — confirm first.
 			final int choice = JOptionPane.showConfirmDialog(this,
-				"Delete every saved session AND the current session's loot?\n"
+				"Delete every saved session, the lifetime archive, AND the current session's loot?\n"
 					+ "This clears the all-time history and cannot be undone.",
 				"Loot Bank Filter",
 				JOptionPane.YES_NO_OPTION,

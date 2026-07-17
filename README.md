@@ -1,5 +1,7 @@
 # Loot Bank Filter
 
+[![Support me on Ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/lathenso)
+
 Tracks the loot you receive per monster/boss during your session and lets you
 filter your bank to show **only the items you looted** — either everything, or
 one source at a time.
@@ -35,6 +37,10 @@ one source at a time.
   header's right-click menu.
 - Switch the panel between **Current session** and **All sessions (total)**;
   filtering follows whichever view is active.
+- Sessions that age out of the saved-session cap are folded into a permanent
+  **lifetime archive** first, so the all-time view never loses loot (a chat
+  message tells you when this happens). Manually deleted sessions are removed
+  for real and are not archived.
 
 ## Configuration
 
@@ -44,7 +50,7 @@ one source at a time.
 | Show session loot overlay | Toggle the on-screen totals panel |
 | Overlay max items | How many item lines the overlay shows |
 | Auto-save session | Save automatically every 5 minutes and on client close |
-| Max saved sessions | How many saved sessions to keep (oldest dropped first) |
+| Max saved sessions | How many saved sessions to keep (oldest fold into the lifetime archive) |
 | Show looted quantity | Display looted amounts on bank stacks while filtering |
 | Debug logging | Diagnostics in the client log (troubleshooting only) |
 
