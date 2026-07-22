@@ -31,10 +31,21 @@ one source at a time.
   display the amount you looted instead of the amount banked (display only —
   withdrawing always uses your real bank quantities).
 
+**Per-source ignore lists**
+- Right-click any item in a source's drop grid → **Remove from filter** to hide
+  that item from that specific source's bank filter. The item stays tracked and
+  visible in the panel, but its tile is greyed out.
+- Right-click a greyed tile → **Add back to filter** to re-enable it.
+- Ignored items are subtracted from both the per-source filter and the
+  filter-all view. An item only disappears from the filter-all if every source
+  that dropped it has ignored it.
+- Ignore lists are keyed per source and persist across sessions. Clearing a
+  session leaves them intact; **Delete ALL sessions** clears them too.
+
 **Sessions**
-- Sessions auto-save every 5 minutes and when the client closes (can be
-  disabled). Save, load, or delete sessions by date/time from the panel
-  header's right-click menu.
+- Sessions auto-save on a configurable interval (1–30 minutes, default 1) and
+  when the client closes (can be disabled). Save, load, or delete sessions by
+  date/time from the panel header's right-click menu.
 - Switch the panel between **Current session** and **All sessions (total)**;
   filtering follows whichever view is active.
 - Sessions that age out of the saved-session cap are folded into a permanent
@@ -49,7 +60,8 @@ one source at a time.
 | Minimum item value | Ignore drops below this per-unit GE price |
 | Show session loot overlay | Toggle the on-screen totals panel |
 | Overlay max items | How many item lines the overlay shows |
-| Auto-save session | Save automatically every 5 minutes and on client close |
+| Auto-save session | Save automatically on the interval below and on client close |
+| Auto-save interval (min) | How often the session auto-saves, in minutes (1–30, default 1) |
 | Max saved sessions | How many saved sessions to keep (oldest fold into the lifetime archive) |
 | Show looted quantity | Display looted amounts on bank stacks while filtering |
 | Debug logging | Diagnostics in the client log (troubleshooting only) |

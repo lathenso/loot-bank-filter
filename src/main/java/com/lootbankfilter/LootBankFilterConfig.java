@@ -45,7 +45,7 @@ public interface LootBankFilterConfig extends Config
 	@ConfigItem(
 		keyName = "autoSave",
 		name = "Auto-save session",
-		description = "Automatically save the session every 5 minutes and when the client closes",
+		description = "Automatically save the session on the interval below, and when the client closes",
 		position = 3
 	)
 	default boolean autoSave()
@@ -53,12 +53,24 @@ public interface LootBankFilterConfig extends Config
 		return true;
 	}
 
+	@Range(min = 1, max = 30)
+	@ConfigItem(
+		keyName = "autoSaveMinutes",
+		name = "Auto-save interval (min)",
+		description = "How often the session auto-saves while tracking, in minutes (only applies when auto-save is on)",
+		position = 4
+	)
+	default int autoSaveMinutes()
+	{
+		return 1;
+	}
+
 	@Range(min = 1, max = 50)
 	@ConfigItem(
 		keyName = "maxSavedSessions",
 		name = "Max saved sessions",
 		description = "How many saved sessions to keep; the oldest are folded into the permanent lifetime archive first",
-		position = 4
+		position = 5
 	)
 	default int maxSavedSessions()
 	{
@@ -69,7 +81,7 @@ public interface LootBankFilterConfig extends Config
 		keyName = "showLootedQuantity",
 		name = "Show looted quantity",
 		description = "While the filter is active, bank stacks display the amount you looted instead of the amount banked. Display only — withdraw options still use the real bank quantities.",
-		position = 5
+		position = 6
 	)
 	default boolean showLootedQuantity()
 	{
@@ -80,7 +92,7 @@ public interface LootBankFilterConfig extends Config
 		keyName = "debugLogging",
 		name = "Debug logging",
 		description = "Writes filter diagnostics to the client log/console. Only needed when troubleshooting.",
-		position = 6
+		position = 7
 	)
 	default boolean debugLogging()
 	{

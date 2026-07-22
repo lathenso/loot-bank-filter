@@ -2,16 +2,21 @@ package com.lootbankfilter;
 
 import com.google.gson.Gson;
 import com.google.gson.JsonSyntaxException;
+import com.google.gson.reflect.TypeToken;
 import com.google.inject.Provides;
+import java.lang.reflect.Type;
 import java.text.SimpleDateFormat;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.Date;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import javax.inject.Inject;
 import javax.swing.SwingUtilities;
@@ -93,6 +98,7 @@ public class LootBankFilterPlugin extends Plugin
 	private static final String CONFIG_GROUP = "lootbankfilter";
 	private static final String KEY_SAVED_SESSIONS = "savedSessions";
 	private static final String KEY_LIFETIME_ARCHIVE = "lifetimeArchive";
+	private static final String KEY_IGNORED_ITEMS = "ignoredItems";
 
 	private static final int BUTTON_WIDTH = 60;
 	private static final int BUTTON_HEIGHT = 16;
@@ -148,6 +154,22 @@ public class LootBankFilterPlugin extends Plugin
 	/** Canonical item id -> looted quantity for the active bank filter. */
 	private Map<Integer, Long> activeFilter = Collections.emptyMap();
 
+	/**
+	 * Per-source ignore lists: source name -> set of canonical item ids the
+	 * user has removed from that source's filter. Ignored items are still
+	 * tracked and shown (greyed) in the panel, but are subtracted from both
+	 * the per-source filter and the filter-all. Persisted under
+	 * {@link #KEY_IGNORED_ITEMS}. Mutated on the client thread only.
+	 */
+	private final Map<String, Set<Integer>> ignoredItems = new HashMap<>();
+
+	/**
+	 * Wall-clock time of the last completed auto-save. The @Schedule tick
+	 * fires every minute (a compile-time constant), but the real save is
+	 * gated on this so it only happens every config.autoSaveMinutes().
+	 */
+	private volatile long lastAutoSaveMillis;
+
 	/** Human-readable label for the active/pending filter (for messages). */
 	private String activeFilterLabel = ALL_LOOT_LABEL;
 
@@ -185,6 +207,10 @@ public class LootBankFilterPlugin extends Plugin
 
 		currentSessionStart = System.currentTimeMillis();
 		dirtySinceSave = false;
+		lastAutoSaveMillis = System.currentTimeMillis();
+
+		// Restore the persisted per-source ignore lists.
+		loadIgnoredItems();
 
 		// One-time cleanup of the old single-slot save key from the
 		// previous version of this plugin.
@@ -361,7 +387,8 @@ public class LootBankFilterPlugin extends Plugin
 				final int gePrice = itemManager.getItemPrice(item.id);
 				sourceValue += (long) gePrice * item.quantity;
 				items.add(new ItemSnapshot(
-					item.id, item.name, item.quantity, gePrice, item.haPrice, item.tradeable));
+					item.id, item.name, item.quantity, gePrice, item.haPrice, item.tradeable,
+					isItemIgnored(source.name, item.id)));
 			}
 			totalValue += sourceValue;
 			snapshot.add(new SourceSnapshot(source.name, source.kills, sourceValue, items));
@@ -580,13 +607,11 @@ public class LootBankFilterPlugin extends Plugin
 				return;
 			}
 
-			final Map<Integer, Long> quantities = new LinkedHashMap<>();
-			for (LootSource source : view.values())
+			final Map<Integer, Long> quantities = buildAllQuantities(view);
+			if (quantities.isEmpty())
 			{
-				for (TrackedItem item : source.items.values())
-				{
-					quantities.merge(item.id, item.quantity, Long::sum);
-				}
+				message("Every tracked item has been removed from the filter.");
+				return;
 			}
 			applyFilter(quantities, showAllSessions ? ALL_TIME_LABEL : ALL_LOOT_LABEL);
 		});
@@ -603,13 +628,195 @@ public class LootBankFilterPlugin extends Plugin
 				message("No items tracked for " + sourceName + ".");
 				return;
 			}
-			final Map<Integer, Long> quantities = new LinkedHashMap<>();
-			for (TrackedItem item : source.items.values())
+			final Map<Integer, Long> quantities = buildSourceQuantities(source);
+			if (quantities.isEmpty())
 			{
-				quantities.put(item.id, item.quantity);
+				message("Every item from " + sourceName + " has been removed from the filter.");
+				return;
 			}
 			applyFilter(quantities, sourceName);
 		});
+	}
+
+	// =====================================================================
+	// 2a. PER-SOURCE IGNORE LISTS
+	//
+	// "Remove from filter" on an item hides it from that source's bank
+	// filter (and, transitively, from the filter-all merge) while leaving it
+	// tracked and visible — greyed — in the panel. Ignores are keyed by
+	// source NAME + canonical item id and persist across sessions.
+	// =====================================================================
+
+	/** True if this (source, item) pair is on the ignore list. */
+	private boolean isItemIgnored(String sourceName, int itemId)
+	{
+		final Set<Integer> set = ignoredItems.get(sourceName);
+		return set != null && set.contains(itemId);
+	}
+
+	/**
+	 * Builds the quantity map for the filter-all, honoring ignores. Each
+	 * source drops its own ignored ids; an item survives if at least one
+	 * non-ignoring source looted it. Client thread only.
+	 */
+	private Map<Integer, Long> buildAllQuantities(Map<String, LootSource> view)
+	{
+		final Map<Integer, Long> quantities = new LinkedHashMap<>();
+		for (LootSource source : view.values())
+		{
+			final Set<Integer> ignored = ignoredItems.get(source.name);
+			for (TrackedItem item : source.items.values())
+			{
+				if (ignored != null && ignored.contains(item.id))
+				{
+					continue;
+				}
+				quantities.merge(item.id, item.quantity, Long::sum);
+			}
+		}
+		return quantities;
+	}
+
+	/** Builds one source's quantity map, honoring its ignores. Client thread only. */
+	private Map<Integer, Long> buildSourceQuantities(LootSource source)
+	{
+		final Set<Integer> ignored = ignoredItems.get(source.name);
+		final Map<Integer, Long> quantities = new LinkedHashMap<>();
+		for (TrackedItem item : source.items.values())
+		{
+			if (ignored != null && ignored.contains(item.id))
+			{
+				continue;
+			}
+			quantities.put(item.id, item.quantity);
+		}
+		return quantities;
+	}
+
+	/** Right-click > "Remove from filter" on an item tile. */
+	void requestIgnoreItem(String sourceName, int itemId)
+	{
+		clientThread.invokeLater(() ->
+		{
+			ignoredItems.computeIfAbsent(sourceName, k -> new HashSet<>()).add(itemId);
+			writeIgnoredItems();
+			refilterActiveIfNeeded();
+			refreshPanel();
+		});
+	}
+
+	/** Right-click > "Add back to filter" on a greyed item tile. */
+	void requestUnignoreItem(String sourceName, int itemId)
+	{
+		clientThread.invokeLater(() ->
+		{
+			final Set<Integer> set = ignoredItems.get(sourceName);
+			if (set == null || !set.remove(itemId))
+			{
+				return;
+			}
+			if (set.isEmpty())
+			{
+				ignoredItems.remove(sourceName);
+			}
+			writeIgnoredItems();
+			refilterActiveIfNeeded();
+			refreshPanel();
+		});
+	}
+
+	/**
+	 * Recomputes the active (or pending) filter from its current label after
+	 * an ignore change, so an open bank updates live without re-issuing the
+	 * "Filtering bank by..." chat message. Client thread only.
+	 */
+	private void refilterActiveIfNeeded()
+	{
+		if (!filterActive && !pendingFilter)
+		{
+			return;
+		}
+
+		final Map<Integer, Long> quantities;
+		if (ALL_LOOT_LABEL.equals(activeFilterLabel) || ALL_TIME_LABEL.equals(activeFilterLabel))
+		{
+			quantities = buildAllQuantities(buildViewSources());
+		}
+		else
+		{
+			final LootSource source = buildViewSources().get(activeFilterLabel);
+			quantities = source == null ? new LinkedHashMap<>() : buildSourceQuantities(source);
+		}
+
+		activeFilter = quantities;
+
+		if (filterActive && isBankOpen())
+		{
+			bankSearch.layoutBank();
+		}
+	}
+
+	/**
+	 * Loads the persisted ignore map. Gson deserializes JSON numbers as
+	 * Double, so we read the id arrays loosely as List&lt;Double&gt; and
+	 * convert via intValue() rather than reading straight into
+	 * Set&lt;Integer&gt; (which would blow up with a ClassCastException the
+	 * first time an id is read back out). Safe off any thread — pure JSON.
+	 */
+	private void loadIgnoredItems()
+	{
+		ignoredItems.clear();
+
+		final String json = configManager.getConfiguration(CONFIG_GROUP, KEY_IGNORED_ITEMS);
+		if (json == null || json.isEmpty())
+		{
+			return;
+		}
+
+		try
+		{
+			final Type type = new TypeToken<Map<String, List<Double>>>()
+			{
+			}.getType();
+			final Map<String, List<Double>> raw = gson.fromJson(json, type);
+			if (raw == null)
+			{
+				return;
+			}
+			for (Map.Entry<String, List<Double>> entry : raw.entrySet())
+			{
+				if (entry.getValue() == null)
+				{
+					continue;
+				}
+				final Set<Integer> ids = new HashSet<>();
+				for (Double id : entry.getValue())
+				{
+					if (id != null)
+					{
+						ids.add(id.intValue());
+					}
+				}
+				if (!ids.isEmpty())
+				{
+					ignoredItems.put(entry.getKey(), ids);
+				}
+			}
+		}
+		catch (JsonSyntaxException ex)
+		{
+			log.warn("Corrupt ignored-items map", ex);
+		}
+	}
+
+	private void writeIgnoredItems()
+	{
+		if (ignoredItems.isEmpty())
+		{
+			configManager.unsetConfiguration(CONFIG_GROUP, KEY_IGNORED_ITEMS);
+			return;
+		}
+		configManager.setConfiguration(CONFIG_GROUP, KEY_IGNORED_ITEMS, gson.toJson(ignoredItems));
 	}
 
 	/** Right-click > "Remove from tracker" on a source box. */
@@ -694,14 +901,31 @@ public class LootBankFilterPlugin extends Plugin
 		});
 	}
 
-	/** Periodic auto-save; the scheduler calls this on an executor thread. */
-	@Schedule(period = 5, unit = ChronoUnit.MINUTES)
+	/**
+	 * Periodic auto-save; the scheduler calls this on an executor thread.
+	 *
+	 * @Schedule requires a compile-time-constant period, so we can't feed it
+	 * config.autoSaveMinutes() directly — instead the tick fires every minute
+	 * and we gate the real save on elapsed wall-clock time against the
+	 * configured interval. The clock is reset each time the interval elapses
+	 * (not only on a successful save), so the cadence stays fixed rather than
+	 * drifting toward "save the instant anything is dirty".
+	 */
+	@Schedule(period = 1, unit = ChronoUnit.MINUTES)
 	public void autoSaveTick()
 	{
 		if (!config.autoSave())
 		{
 			return;
 		}
+
+		final long now = System.currentTimeMillis();
+		if (now - lastAutoSaveMillis < config.autoSaveMinutes() * 60_000L)
+		{
+			return;
+		}
+		lastAutoSaveMillis = now;
+
 		clientThread.invokeLater(() ->
 		{
 			if (dirtySinceSave && !lootSources.isEmpty())
@@ -929,6 +1153,11 @@ public class LootBankFilterPlugin extends Plugin
 			sessionLoot.clear();
 			writeSavedSessions(new ArrayList<>());
 			configManager.unsetConfiguration(CONFIG_GROUP, KEY_LIFETIME_ARCHIVE);
+
+			// "Delete ALL" is the reset-everything action, so drop the
+			// per-source ignore lists too.
+			ignoredItems.clear();
+			configManager.unsetConfiguration(CONFIG_GROUP, KEY_IGNORED_ITEMS);
 
 			currentSessionStart = System.currentTimeMillis();
 			dirtySinceSave = false;
@@ -1411,8 +1640,9 @@ public class LootBankFilterPlugin extends Plugin
 		final int gePrice;   // live GE price at snapshot time
 		final int haPrice;   // high alchemy value
 		final boolean tradeable;
+		final boolean ignored; // removed from this source's filter
 
-		ItemSnapshot(int id, String name, long quantity, int gePrice, int haPrice, boolean tradeable)
+		ItemSnapshot(int id, String name, long quantity, int gePrice, int haPrice, boolean tradeable, boolean ignored)
 		{
 			this.id = id;
 			this.name = name;
@@ -1420,6 +1650,7 @@ public class LootBankFilterPlugin extends Plugin
 			this.gePrice = gePrice;
 			this.haPrice = haPrice;
 			this.tradeable = tradeable;
+			this.ignored = ignored;
 		}
 	}
 

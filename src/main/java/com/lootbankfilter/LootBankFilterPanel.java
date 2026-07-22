@@ -7,12 +7,14 @@ import java.awt.Dimension;
 import java.awt.GridLayout;
 import java.awt.event.MouseAdapter;
 import java.awt.event.MouseEvent;
+import java.awt.image.BufferedImage;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 import javax.swing.BorderFactory;
 import javax.swing.Box;
 import javax.swing.BoxLayout;
+import javax.swing.ImageIcon;
 import javax.swing.JComboBox;
 import javax.swing.JComponent;
 import javax.swing.JLabel;
@@ -41,6 +43,11 @@ import net.runelite.client.util.QuantityFormatter;
  *   - "Filter in bank"       -> filters the bank to that source's drops
  *   - "Remove from tracker"  -> drops the source from the session data
  *
+ * Right-clicking an individual item tile opens its own menu:
+ *   - "Remove from filter"   -> greys the tile and drops the item from this
+ *                               source's filter (and the filter-all merge)
+ *   - "Add back to filter"   -> restores a previously removed item
+ *
  * All methods here run on the AWT Event Dispatch Thread. The panel never
  * touches live game state: the plugin hands it immutable snapshots via
  * {@link #updatePanel}.
@@ -52,6 +59,11 @@ class LootBankFilterPanel extends PluginPanel
 	/** Item tile colors: darker than the box background (30,30,30). */
 	private static final Color TILE_COLOR = new Color(22, 22, 22);
 	private static final Color TILE_HOVER_COLOR = new Color(34, 34, 34);
+
+	/** Tile treatment for items removed from the filter ("ignored"). */
+	private static final Color TILE_IGNORED_COLOR = new Color(16, 16, 16);
+	private static final Color TILE_IGNORED_HOVER_COLOR = new Color(26, 26, 26);
+	private static final Color TILE_IGNORED_BORDER_COLOR = new Color(70, 70, 70);
 
 	private final LootBankFilterPlugin plugin;
 	private final ItemManager itemManager;
@@ -304,7 +316,7 @@ class LootBankFilterPanel extends PluginPanel
 
 			for (LootBankFilterPlugin.ItemSnapshot item : source.items)
 			{
-				itemGrid.add(buildItemCell(item));
+				itemGrid.add(buildItemCell(source.name, item));
 			}
 
 			// Pad the last row with empty cells so the grid always looks complete.
@@ -342,21 +354,53 @@ class LootBankFilterPanel extends PluginPanel
 		return box;
 	}
 
-	/** One grid cell: dark square, centered icon, hover highlight, tooltip. */
-	private JLabel buildItemCell(LootBankFilterPlugin.ItemSnapshot item)
+	/**
+	 * One grid cell: dark square, centered icon, hover highlight, tooltip.
+	 * Ignored items (removed from this source's filter) render greyed — a
+	 * dimmed grayscale icon, a darker tile, and an outline — and carry their
+	 * own right-click menu to add them back. Non-ignored cells carry the
+	 * "Remove from filter" menu. Either way the cell's own popup takes
+	 * precedence over the source box's inherited menu.
+	 */
+	private JLabel buildItemCell(String sourceName, LootBankFilterPlugin.ItemSnapshot item)
 	{
+		final boolean ignored = item.ignored;
+		final Color base = ignored ? TILE_IGNORED_COLOR : TILE_COLOR;
+		final Color hover = ignored ? TILE_IGNORED_HOVER_COLOR : TILE_HOVER_COLOR;
+
 		final JLabel cell = new JLabel();
 		cell.setOpaque(true);
-		cell.setBackground(TILE_COLOR);
+		cell.setBackground(base);
 		cell.setHorizontalAlignment(SwingConstants.CENTER);
 		cell.setVerticalAlignment(SwingConstants.CENTER);
 		cell.setPreferredSize(new Dimension(40, 36));
 		cell.setToolTipText(buildTooltip(item));
+		if (ignored)
+		{
+			cell.setBorder(BorderFactory.createLineBorder(TILE_IGNORED_BORDER_COLOR));
+		}
 
-		// AsyncBufferedImage repaints the label once the sprite loads.
+		// AsyncBufferedImage repaints the label once the sprite loads. For
+		// ignored items we wait for the load, then swap in a dimmed grayscale
+		// version so the tile clearly reads as "not in the filter".
 		final AsyncBufferedImage img = itemManager.getImage(
 			item.id, (int) Math.min(item.quantity, Integer.MAX_VALUE), item.quantity > 1);
-		img.addTo(cell);
+		if (ignored)
+		{
+			img.onLoaded(() ->
+			{
+				final BufferedImage disabled = toDisabledIcon(img);
+				SwingUtilities.invokeLater(() ->
+				{
+					cell.setIcon(new ImageIcon(disabled));
+					cell.repaint();
+				});
+			});
+		}
+		else
+		{
+			img.addTo(cell);
+		}
 
 		// Subtle hover highlight, like the built-in Loot Tracker.
 		cell.addMouseListener(new MouseAdapter()
@@ -364,18 +408,64 @@ class LootBankFilterPanel extends PluginPanel
 			@Override
 			public void mouseEntered(MouseEvent e)
 			{
-				cell.setBackground(TILE_HOVER_COLOR);
+				cell.setBackground(hover);
 			}
 
 			@Override
 			public void mouseExited(MouseEvent e)
 			{
-				cell.setBackground(TILE_COLOR);
+				cell.setBackground(base);
 			}
 		});
 
-		cell.setInheritsPopupMenu(true);
+		// Per-item right-click menu (overrides the source box's inherited one).
+		final JPopupMenu itemMenu = new JPopupMenu();
+		if (ignored)
+		{
+			final JMenuItem addBack = new JMenuItem("Add back to filter");
+			addBack.addActionListener(e -> plugin.requestUnignoreItem(sourceName, item.id));
+			itemMenu.add(addBack);
+		}
+		else
+		{
+			final JMenuItem remove = new JMenuItem("Remove from filter");
+			remove.addActionListener(e -> plugin.requestIgnoreItem(sourceName, item.id));
+			itemMenu.add(remove);
+		}
+		cell.setComponentPopupMenu(itemMenu);
+
 		return cell;
+	}
+
+	/**
+	 * Grayscale + dim an item icon for the "removed from filter" look. Pure
+	 * AWT pixel work so it doesn't depend on any RuneLite image helper.
+	 * Must be called after the source AsyncBufferedImage has loaded.
+	 */
+	private static BufferedImage toDisabledIcon(BufferedImage src)
+	{
+		final int w = src.getWidth();
+		final int h = src.getHeight();
+		final BufferedImage out = new BufferedImage(w, h, BufferedImage.TYPE_INT_ARGB);
+		for (int y = 0; y < h; y++)
+		{
+			for (int x = 0; x < w; x++)
+			{
+				final int argb = src.getRGB(x, y);
+				final int a = (argb >>> 24) & 0xFF;
+				if (a == 0)
+				{
+					continue; // keep fully transparent pixels transparent
+				}
+				final int r = (argb >> 16) & 0xFF;
+				final int g = (argb >> 8) & 0xFF;
+				final int b = argb & 0xFF;
+				final int lum = (int) (0.299 * r + 0.587 * g + 0.114 * b);
+				final int da = a * 45 / 100; // dim to ~45% opacity
+				out.setRGB(x, y, (da << 24) | (lum << 16) | (lum << 8) | lum);
+			}
+		}
+		return out;
 	}
 
 	/**
@@ -405,18 +495,30 @@ class LootBankFilterPanel extends PluginPanel
 			.append(QuantityFormatter.formatNumber((long) item.haPrice * item.quantity))
 			.append(" gp total");
 
+		if (item.ignored)
+		{
+			sb.append("<br><i>Removed from filter &#8212; right-click to add back</i>");
+		}
+
 		return sb.append("</html>").toString();
 	}
 
-	/** Attach the popup to a component and let all its children inherit it. */
+	/**
+	 * Attach the popup to a component and its children. Components that
+	 * already carry their own popup (e.g. item tiles, which have their own
+	 * "Remove from filter" / "Add back to filter" menu) are left untouched
+	 * so the source-box menu doesn't overwrite them.
+	 */
 	private static void attachPopup(JComponent component, JPopupMenu menu)
 	{
-		component.setComponentPopupMenu(menu);
+		if (component.getComponentPopupMenu() == null)
+		{
+			component.setComponentPopupMenu(menu);
+		}
 		for (java.awt.Component child : component.getComponents())
 		{
 			if (child instanceof JComponent)
 			{
-				((JComponent) child).setInheritsPopupMenu(true);
 				attachPopup((JComponent) child, menu);
 			}
 		}
